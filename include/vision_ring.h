@@ -19,7 +19,7 @@
 #include <std_msgs/Empty.h>
 #include <std_msgs/Int32.h>
 #include <sensor_msgs/Image.h>
-#include <sensor_msgs/LaserScan.h>
+#include <sensor_msgs/PointCloud2.h>
 
 using namespace std;
 
@@ -30,20 +30,17 @@ enum State
     OFFBOARD,
     TAKEOFF,          // 起飞
     HOVER,            // 悬停
-    AVOIDANCE,        // 避障
-    THROUGH_DOOR,     // 穿门动作
+    ACHIEVE_START,    // 开始位置
     THROUGH_RING,     // 穿环动作
-    CRUISE,           // 巡航
+    ACHIEVE_FINAL,    // 结束位置
     LAND,             // 降落
     END               // 结束
 };
 
-float dist_front = 10.0;
-float dist_left = 10.0;
-float dist_right = 10.0;
-float dist_back = 10.0;
+static float estimated_gate_y = 0.0;
+static float estimated_gate_z = 0.0;
+static bool has_gate_estimate = false;
 
-extern int target_color;
 extern State mission_num;
 
 mavros_msgs::PositionTarget setpoint_raw;
@@ -161,153 +158,95 @@ bool precision_land()
     return false;
 }
 
-/************************************************************************
-函数 5:颜色识别
-检测图像中心颜色以判断色块颜色
-*************************************************************************/
-void color_seen(const sensor_msgs::Image::ConstPtr &msg)
-{
-	if (mission_num > 1||target_color != 0) return;
-
-	int center_x = msg->width / 2;
-    int center_y = msg->height / 2;
-    int index = (center_y * msg->width + center_x) * 3;
-
-	int r = msg->data[index];
-	int g = msg->data[index + 1];
-	int b = msg->data[index + 2];
-
-	if (r > 100 && r > g * 1.5 && r > b * 1.5) 
-    {
-        ROS_INFO(">>> Detect Color: RED! (R=%d G=%d B=%d)", r, g, b);
-		target_color = 1;
-    }
-    else if (b > 100 && b > r * 1.5 && b > g * 1.5) 
-    {
-        ROS_INFO(">>> Detect Color: BLUE! (R=%d G=%d B=%d)", r, g, b);
-		target_color = 2;
-    }
-}
 
 /************************************************************************
-函数 6:位置微调
-根据雷达数据微调目标点
+函数 5: 视觉伺服穿环控制 - 【动态坐标估计记忆】+【盲区记忆重放】
 *************************************************************************/
-void laser_cb(const sensor_msgs::LaserScan::ConstPtr &msg)
+bool mission_through_ring(float u, float v, float w);
+bool mission_through_ring(float u, float v, float w)
 {
-    int len = msg->ranges.size();
-    float min_f = 10.0, min_l = 10.0, min_r = 10.0, min_b = 10.0;
+    // === 1. 相机内参 ===
+    const float focal_length = 343.5; 
+    const float img_cx = 320.0;       
+    const float img_cy = 240.0;       
+    const float W_real = 0.9;         
+
+    float safe_w = (w > 10.0) ? w : 10.0; 
+    float dist_x = (focal_length * W_real) / safe_w; 
     
-    // 假设 0=前, len/4=左, len/2=后, 3*len/4=右
-    
-    // 1. 前方 (Front): -30 ~ +30 度
-    int range_f = len / 6; 
-    for(int i=0; i<range_f/2; i++) if(msg->ranges[i]>0.1 && msg->ranges[i]<min_f) min_f = msg->ranges[i];
-    for(int i=len-range_f/2; i<len; i++) if(msg->ranges[i]>0.1 && msg->ranges[i]<min_f) min_f = msg->ranges[i];
+    // 计算相机坐标系下的 Y(左右) 和 Z(上下) 偏差
+    float dist_y = -((u - img_cx) * dist_x) / focal_length; 
+    float dist_z = -((v - img_cy) * dist_x) / focal_length; 
 
-    // 2. 左侧 (Left): +30 ~ +150 度 (覆盖整个左半边)
-    int idx_30 = len / 12;
-    int idx_150 = len * 5 / 12;
-    for(int i=idx_30; i<idx_150; i++) {
-        if(msg->ranges[i] > 0.1 && msg->ranges[i] < min_l) min_l = msg->ranges[i];
-    }
-
-    // 3. 右侧 (Right): +210 ~ +330 度 (覆盖整个右半边)
-    int idx_210 = len * 7 / 12;
-    int idx_330 = len * 11 / 12;
-    for(int i=idx_210; i<idx_330; i++) {
-        if(msg->ranges[i] > 0.1 && msg->ranges[i] < min_r) min_r = msg->ranges[i];
-    }
-
-    dist_front = min_f;
-    dist_left = min_l;
-    dist_right = min_r;
-}
-// 安全修正函数
-void apply_safety_corrections()
-{
-    // === 参数设置 ===
-    float safe_margin = 0.6;  // 触发避障的距离
-    float stop_dist = 0.3;    // 前方急停距离
-    
-    // 强力推移距离 
-    float push_force = 0.2;   
-
-	bool is_ring_mode = (mission_num == THROUGH_RING); 
-
-    // === 1. 穿环专用：强力居中 (Lidar) ===
-    // 只有当左右都有数据（看到了两边的柱子）才启用
-    if (is_ring_mode && dist_left < 0.5 && dist_right < 0.5)
+    // ===  核心逻辑：动态估计门的世界坐标 (远距离时触发)  ===
+    // 只有在距离适中 (1.0m~5.0m)，且框比较完整时，我们才信任视觉并更新记忆
+    if (dist_x > 1.0 && dist_x < 5.0 && safe_w < 400.0) 
     {
-        // 居中误差
-        float center_err = dist_left - dist_right;
-        
-        // 目标：死死咬住中心线
-        float corr_y = center_err * 0.5; 
+        // 结合无人机当前的世界坐标和偏航角，算出大门当前的绝对物理坐标！
+        float current_gate_y = local_pos.pose.pose.position.y + dist_x * sin(yaw) + dist_y * cos(yaw);
+        float current_gate_z = local_pos.pose.pose.position.z + dist_z;
 
-        // 限幅：虽然系数大，但单次修正量不要太大，防止甩尾
-        if (corr_y > 0.2) corr_y = -0.2;
-        if (corr_y < -0.2) corr_y = 0.2;
-
-        setpoint_raw.position.y += corr_y;
-        
-        // ROS_INFO_THROTTLE(0.2, "Ring Centering: L=%.2f R=%.2f Err=%.2f", dist_left, dist_right, center_err);
-        return; // 穿环时优先执行这个，跳过后面的普通避障
-    }
-    bool is_dangerous = false; // 标记是否处于危险状态
-
-    // 1. 左右避障 (基于当前位置的强力弹开)
-    if (dist_left < safe_margin) 
-    {
-        is_dangerous = true;
-        
-        //放弃原目标
-        setpoint_raw.position.y = local_pos.pose.pose.position.y + push_force;
-    }
-    else if (dist_right < safe_margin) 
-    {
-        is_dangerous = true;
-        
-        setpoint_raw.position.y = local_pos.pose.pose.position.y - push_force;
-    }
-
-    // 2. 自动居中 (在不危险但需要微调时使用)
-    // 只有在左右都安全，但通道较窄时才启用这个温和的逻辑
-    else if (dist_left < 1.5 && dist_right < 1.5)
-    {
-        float center_err = dist_left - dist_right;
-        if (fabs(center_err) > 0.2) // 只有偏差较大才修，防止抖动
-        {
-            // 在原目标基础上微调 (因为还要继续赶路)
-            // 这里系数给大一点，因为还要对抗向前的速度矢量
-            setpoint_raw.position.y += (center_err * 0.3); 
+        if (!has_gate_estimate) {
+            // 第一次看到门，直接写入记忆
+            estimated_gate_y = current_gate_y;
+            estimated_gate_z = current_gate_z;
+            has_gate_estimate = true;
+        } else {
+            // 指数移动平均 (EMA) 滤波：平滑跳变，新数据占 10%，历史记忆占 90%
+            estimated_gate_y = 0.1 * current_gate_y + 0.9 * estimated_gate_y;
+            estimated_gate_z = 0.1 * current_gate_z + 0.9 * estimated_gate_z;
         }
     }
 
-    // 3. 前方防撞与速度压制
-    // 如果处于避障状态 (is_dangerous)，或者前方有障碍，限制前进速度
-    if (is_dangerous || dist_front < 1.5)
+    // === 2. 近距离盲穿保护 (重放记忆) ===
+    if (safe_w > 500.0 || dist_x < 0.7) 
     {
-        // 限制目标点 X 轴只能在当前位置前方很近的地方 (例如 0.2米)
-        // 这样飞控计算出的前进速度就会很慢，给侧向避障留出时间
-        float max_forward_step = 0.2; 
+        setpoint_raw.type_mask = 8 + 16 + 32 + 64 + 128 + 256 + 512;
+        setpoint_raw.coordinate_frame = 1;
         
-        // 原计划的 X 目标
-        float target_x = setpoint_raw.position.x;
-        // 当前 X
-        float current_x = local_pos.pose.pose.position.x;
-
-        // 如果原目标太远，强制拉回来
-        if (target_x - current_x > max_forward_step) {
-            setpoint_raw.position.x = current_x + max_forward_step;
+        float step_forward = 0.5; // 加速冲刺
+        setpoint_raw.position.x = local_pos.pose.pose.position.x + step_forward * cos(yaw);
+        
+        if (has_gate_estimate) {
+            //  提取记忆：使用最后一次完美的估计位置进行穿刺！
+            setpoint_raw.position.y = estimated_gate_y;
+            setpoint_raw.position.z = estimated_gate_z;
+            ROS_INFO_THROTTLE(0.2, " 盲穿: 调用记忆坐标 Y=%.2f, Z=%.2f", estimated_gate_y, estimated_gate_z);
+        } else {
+            // 如果毫无记忆，只能保持当前高度平飞
+            setpoint_raw.position.y = local_pos.pose.pose.position.y + step_forward * sin(yaw);
+            setpoint_raw.position.z = local_pos.pose.pose.position.z;
         }
+        
+        setpoint_raw.yaw = yaw;
+        return true;
     }
 
-    // 4. 前方急停 (最高优先级)
-    if (dist_front < stop_dist)
-    {
-        ROS_WARN_THROTTLE(0.5, "Emergency Stop!");
-        setpoint_raw.position.x = local_pos.pose.pose.position.x; // 锁死 X
-        // Y 轴保持上面的避障逻辑，允许它左右躲避
+    // === 3. 正常视觉伺服：向记忆中心点靠拢 ===
+    float Kp_y = 0.6;  
+    float Kp_z = 1.0;  
+    float step_forward = 0.2; 
+    
+    float align_error = sqrt(dist_y * dist_y + dist_z * dist_z);
+
+    // 刹车对准逻辑
+    if (align_error > 0.15 && dist_x > 0.8) {
+        step_forward = 0.05; 
     }
+
+    if (dist_x > 5.0) dist_x = 5.0; 
+
+    float delta_X = step_forward * cos(yaw) - (dist_y * Kp_y) * sin(yaw);
+    float delta_Y = step_forward * sin(yaw) + (dist_y * Kp_y) * cos(yaw);
+
+    setpoint_raw.type_mask = 8 + 16 + 32 + 64 + 128 + 256 + 512;
+    setpoint_raw.coordinate_frame = 1;
+
+    setpoint_raw.position.x = local_pos.pose.pose.position.x + delta_X;
+    setpoint_raw.position.y = local_pos.pose.pose.position.y + delta_Y;
+    setpoint_raw.position.z = local_pos.pose.pose.position.z + (dist_z * Kp_z);
+    
+    setpoint_raw.yaw = yaw;
+
+    return true;
 }
